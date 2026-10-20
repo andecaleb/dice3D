@@ -87,7 +87,6 @@ function makeFaceTexture(value) {
   return texture;
 }
 
-// ------- Google Maps-style pin texture -------
 function makeMarkerTexture(color = "#ea4335") {
   const size = 256;
   const canvas = document.createElement("canvas");
@@ -99,13 +98,11 @@ function makeMarkerTexture(color = "#ea4335") {
   const headR = size * 0.28;
   const headCY = size * 0.36;
 
-  // Shadow
   ctx.fillStyle = "rgba(0,0,0,0.18)";
   ctx.beginPath();
   ctx.ellipse(cx, size * 0.9, size * 0.16, size * 0.045, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // Pin body
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(cx, headCY, headR, Math.PI * 0.15, Math.PI * 0.85, true);
@@ -113,13 +110,11 @@ function makeMarkerTexture(color = "#ea4335") {
   ctx.closePath();
   ctx.fill();
 
-  // Inner circle
   ctx.fillStyle = "#ffffff";
   ctx.beginPath();
   ctx.arc(cx, headCY, headR * 0.45, 0, Math.PI * 2);
   ctx.fill();
 
-  // Highlight
   ctx.fillStyle = "rgba(255,255,255,0.35)";
   ctx.beginPath();
   ctx.arc(
@@ -138,8 +133,6 @@ function makeMarkerTexture(color = "#ea4335") {
   return texture;
 }
 
-// One marker. Its pin base sits exactly on the floor (y = 0).
-// The sprite sits at the top of the pin, hovering above the ground.
 function MapMarker({ texture, animRef, index }) {
   const groupRef = useRef();
   const spriteRef = useRef();
@@ -152,17 +145,24 @@ function MapMarker({ texture, animRef, index }) {
     const a = animRef.current.markers[index];
     if (!a) return;
 
-    // Move X/Z toward target with easing — this is the "hop" trajectory.
+    // Move X/Z toward current target.
     const ease = 1 - Math.exp(-4 * delta);
     g.position.x = THREE.MathUtils.lerp(g.position.x, a.x, ease);
     g.position.z = THREE.MathUtils.lerp(g.position.z, a.z, ease);
 
-    // The "hop": a parabolic arc driven by `a.hop`. `hop` goes 0 → 1 → 0
-    // across the hop duration, so the sprite rises and falls.
-    const hopHeight = Math.sin(Math.min(a.hop, 1) * Math.PI) * a.hopScale;
+    // Hop arc: `hop` is 0..1 progress. Only animate y when hopping.
+    let hopHeight = 0;
+    if (a.hopActive && a.hopProgress < 1) {
+      a.hopProgress += delta / a.hopDuration;
+      if (a.hopProgress >= 1) {
+        a.hopProgress = 1;
+        a.hopActive = false;
+      }
+      hopHeight = Math.sin(a.hopProgress * Math.PI) * a.hopScale;
+    }
     s.position.y = 1.15 + hopHeight;
 
-    // Billboard: always face the camera horizontally.
+    // Billboard.
     s.lookAt(
       state.camera.position.x,
       s.getWorldPosition(new THREE.Vector3()).y,
@@ -172,7 +172,6 @@ function MapMarker({ texture, animRef, index }) {
 
   return (
     <group ref={groupRef}>
-      {/* Pin sprite (billboarded) — sits above the floor with a small hover */}
       <sprite ref={spriteRef} scale={[1.3, 1.3, 1.3]} position={[0, 1.15, 0]}>
         <spriteMaterial
           map={texture}
@@ -185,8 +184,6 @@ function MapMarker({ texture, animRef, index }) {
   );
 }
 
-// Marker field: keeps pins planted on the map, and on each toss reassigns
-// each pin to a new location ONE AFTER ANOTHER (sequenced hop animation).
 const MARKER_COUNT = 7;
 const MARKER_COLORS = [
   "#ea4335",
@@ -198,89 +195,133 @@ const MARKER_COLORS = [
   "#fbbc04",
 ];
 
-// A safe region on the map for pins to live in (doesn't overlap the dice).
-const MAP_RADIUS_MIN = 3.2;
-const MAP_RADIUS_MAX = 8.5;
+// Edge band on the map for marker starting positions.
+const EDGE_MIN_RADIUS = 7.5;
+const EDGE_MAX_RADIUS = 10.5;
 
-function randomMapPoint(avoid = []) {
-  for (let attempt = 0; attempt < 20; attempt++) {
+// Interior band for marker destinations after a move.
+const INTERIOR_MIN_RADIUS = 2.5;
+const INTERIOR_MAX_RADIUS = 7.0;
+
+function randomEdgePoint(avoid = []) {
+  for (let attempt = 0; attempt < 30; attempt++) {
     const angle = Math.random() * Math.PI * 2;
     const r =
-      MAP_RADIUS_MIN + Math.random() * (MAP_RADIUS_MAX - MAP_RADIUS_MIN);
+      EDGE_MIN_RADIUS + Math.random() * (EDGE_MAX_RADIUS - EDGE_MIN_RADIUS);
     const p = { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
     let tooClose = false;
     for (const q of avoid) {
       const dx = p.x - q.x;
       const dz = p.z - q.z;
-      if (dx * dx + dz * dz < 1.6 * 1.6) {
+      if (dx * dx + dz * dz < 1.8 * 1.8) {
         tooClose = true;
         break;
       }
     }
     if (!tooClose) return p;
   }
-  // Fallback
-  return { x: 0, z: 0 };
+  const angle = Math.random() * Math.PI * 2;
+  return {
+    x: Math.cos(angle) * EDGE_MIN_RADIUS,
+    z: Math.sin(angle) * EDGE_MIN_RADIUS,
+  };
 }
 
-function MarkerField({ tossToken, animRef }) {
+function randomInteriorPoint(avoid = []) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    const angle = Math.random() * Math.PI * 2;
+    const r =
+      INTERIOR_MIN_RADIUS +
+      Math.random() * (INTERIOR_MAX_RADIUS - INTERIOR_MIN_RADIUS);
+    const p = { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
+    let tooClose = false;
+    for (const q of avoid) {
+      const dx = p.x - q.x;
+      const dz = p.z - q.z;
+      if (dx * dx + dz * dz < 1.8 * 1.8) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) return p;
+  }
+  const angle = Math.random() * Math.PI * 2;
+  return {
+    x: Math.cos(angle) * INTERIOR_MIN_RADIUS,
+    z: Math.sin(angle) * INTERIOR_MIN_RADIUS,
+  };
+}
+
+function MarkerField({ tossToken, animRef, onMarkerMove }) {
   const textures = useMemo(
     () => MARKER_COLORS.map((c) => makeMarkerTexture(c)),
     [],
   );
 
-  // Initial random placements, shared across mounts.
-  if (!animRef.current.markers || animRef.current.markers.length === 0) {
+  // Initialize markers on the edge of the map.
+  if (!animRef.current.markers) {
     const initial = [];
     for (let i = 0; i < MARKER_COUNT; i++) {
-      const pt = randomMapPoint(initial);
+      const pt = randomEdgePoint(initial.map((m) => ({ x: m.x, z: m.z })));
       initial.push({
         x: pt.x,
         z: pt.z,
-        hop: 1, // start resting
-        hopScale: 0.55, // how high this marker jumps
+        hopProgress: 1,
+        hopActive: false,
+        hopDuration: 0.9,
+        hopScale: 0.55,
       });
     }
     animRef.current.markers = initial;
+    // Track which markers have already moved in the current cycle.
+    animRef.current.movedCount = 0;
   }
 
-  // On each toss: reassign each marker to a new random spot, but stagger
-  // the hops so they move ONE AFTER ANOTHER (not all at once).
+  // On each toss, move exactly ONE marker (the next one in sequence).
   useEffect(() => {
     if (!tossToken) return;
-    const markers = animRef.current.markers;
-    if (!markers) return;
 
-    const STAGGER_MS = 220; // delay between each marker's hop start
-    const timers = [];
+    const state = animRef.current;
+    if (!state.markers) return;
 
-    // Build the sequence.
-    for (let i = 0; i < markers.length; i++) {
-      const slot = i;
-      const delay = slot * STAGGER_MS;
-
-      const startTimer = setTimeout(() => {
-        // Pick a new position that doesn't overlap other markers' targets
-        // (using current targets as avoidance hints).
-        const others = markers
-          .map((m, idx) => (idx === slot ? null : { x: m.x, z: m.z }))
-          .filter(Boolean);
-        const dest = randomMapPoint(others);
-
-        // Kick off the hop for this marker.
-        markers[slot].targetX = dest.x;
-        markers[slot].targetZ = dest.z;
-        markers[slot].hop = 0;
-        markers[slot].hopScale = 0.5 + Math.random() * 0.6;
-      }, delay);
-
-      timers.push(startTimer);
+    // If all markers have moved, reset the cycle: all return to the edge.
+    if (state.movedCount >= MARKER_COUNT) {
+      state.movedCount = 0;
+      for (let i = 0; i < state.markers.length; i++) {
+        const others = state.markers
+          .filter((_, idx) => idx !== i)
+          .map((m) => ({ x: m.x, z: m.z }));
+        const pt = randomEdgePoint(others);
+        const m = state.markers[i];
+        m.x = pt.x;
+        m.z = pt.z;
+        m.hopProgress = 0;
+        m.hopActive = true;
+        m.hopDuration = 0.9;
+        m.hopScale = 0.4 + Math.random() * 0.5;
+      }
+      onMarkerMove?.(0, "reset");
+      return;
     }
 
-    // After the stagger completes, let markers glide to their new spots
-    // (the hop parameter is animated in useFrame).
-    return () => timers.forEach(clearTimeout);
-  }, [tossToken, animRef]);
+    // Otherwise move ONE marker (the next in line).
+    const idx = state.movedCount;
+    const others = state.markers
+      .filter((_, i) => i !== idx)
+      .map((m) => ({ x: m.x, z: m.z }));
+    const pt = randomInteriorPoint(others);
+
+    const m = state.markers[idx];
+    m.x = pt.x;
+    m.z = pt.z;
+    m.hopProgress = 0;
+    m.hopActive = true;
+    m.hopDuration = 1.1;
+    m.hopScale = 0.6 + Math.random() * 0.6;
+
+    state.movedCount += 1;
+    onMarkerMove?.(idx + 1, "moved");
+  }, [tossToken, animRef, onMarkerMove]);
 
   return (
     <group>
@@ -431,7 +472,7 @@ function Dice({ tossToken, onResult, orbitState }) {
         targetRadius = Math.max(16, apex * 2.6 + 8);
         targetLookY = apex * 0.45;
       } else {
-        targetRadius = 12;
+        targetRadius = 14;
         targetLookY = REST_Y * 0.8;
       }
 
@@ -610,6 +651,10 @@ export default function AbujaDice() {
   const [tossToken, setTossToken] = useState(0);
   const [result, setResult] = useState(null);
   const [rolling, setRolling] = useState(false);
+  // Track markers moved this cycle: value 0..7.
+  const [movedCount, setMovedCount] = useState(0);
+  // Log of movement events.
+  const [log, setLog] = useState([]);
 
   const wrapRef = useRef(null);
 
@@ -620,12 +665,11 @@ export default function AbujaDice() {
     lastY: 0,
     theta: Math.PI / 4,
     phi: Math.PI / 3.2,
-    radius: 12,
+    radius: 14,
     lookY: REST_Y * 0.8,
   });
 
-  // Shared marker state, initialized with random map positions.
-  const markerAnimRef = useRef({ markers: null });
+  const markerAnimRef = useRef({ markers: null, movedCount: 0 });
 
   useOrbitDrag(wrapRef, orbitState);
 
@@ -639,6 +683,34 @@ export default function AbujaDice() {
   const recordResult = useCallback((value) => {
     setResult(value);
     setRolling(false);
+  }, []);
+
+  const handleMarkerMove = useCallback((count, kind) => {
+    if (kind === "reset") {
+      setMovedCount(0);
+      setLog((l) =>
+        [
+          {
+            id: Date.now(),
+            text: "All markers returned to the edge — new cycle",
+            kind: "reset",
+          },
+          ...l,
+        ].slice(0, 8),
+      );
+    } else {
+      setMovedCount(count);
+      setLog((l) =>
+        [
+          {
+            id: Date.now(),
+            text: `Marker ${count} moved (${count}/7)`,
+            kind: "moved",
+          },
+          ...l,
+        ].slice(0, 8),
+      );
+    }
   }, []);
 
   const handleClick = useCallback(() => {
@@ -664,7 +736,7 @@ export default function AbujaDice() {
         * { box-sizing: border-box; }
         .result-panel {
           position: fixed; top: 20px; right: 20px; z-index: 10;
-          min-width: 150px; padding: 16px 20px;
+          min-width: 180px; padding: 16px 20px;
           background: rgba(16, 26, 39, 0.85);
           border: 1px solid #3a4c62; border-radius: 14px;
           backdrop-filter: blur(10px);
@@ -675,6 +747,23 @@ export default function AbujaDice() {
         .result-panel .value { font-size: 44px; font-weight: 700; line-height: 1; color: #f1c47d; }
         .result-panel .status { font-size: 10px; letter-spacing: 1.2px; margin-top: 6px; color: #75c9a1; }
         .result-panel .status.rolling { color: #e7b86c; }
+        .result-panel .divider { height: 1px; background: #2c3a4b; margin: 12px 0; }
+        .result-panel .progress { font-size: 11px; color: #96a6b9; letter-spacing: 1px; }
+        .result-panel .progress strong { color: #f1c47d; }
+        .result-panel .bar { height: 4px; background: #1e2937; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+        .result-panel .bar-fill { height: 100%; background: #75c9a1; transition: width 0.3s ease; }
+        .log-panel {
+          position: fixed; top: 220px; right: 20px; z-index: 10;
+          width: 180px; max-height: 40vh; overflow-y: auto;
+          background: rgba(16, 26, 39, 0.75);
+          border: 1px solid #2c3a4b; border-radius: 12px;
+          padding: 12px; font-family: 'DM Mono', ui-monospace, monospace;
+          font-size: 10px; color: #96a6b9; letter-spacing: 0.6px;
+          user-select: none; pointer-events: none;
+        }
+        .log-panel h4 { margin: 0 0 8px; font-size: 9px; letter-spacing: 1.5px; color: #f1c47d; }
+        .log-panel .entry { padding: 4px 0; border-bottom: 1px solid #1e2937; }
+        .log-panel .entry.reset { color: #e7b86c; }
         .hint { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 10;
           font-family: 'DM Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 1.5px;
           color: #96a6b9; background: rgba(16,26,39,0.7); padding: 8px 14px; border-radius: 20px;
@@ -713,7 +802,11 @@ export default function AbujaDice() {
             far={4}
           />
 
-          <MarkerField tossToken={tossToken} animRef={markerAnimRef} />
+          <MarkerField
+            tossToken={tossToken}
+            animRef={markerAnimRef}
+            onMarkerMove={handleMarkerMove}
+          />
 
           <Dice
             tossToken={tossToken}
@@ -729,6 +822,31 @@ export default function AbujaDice() {
         <div className={`status ${rolling ? "rolling" : ""}`}>
           {rolling ? "ROLLING..." : result ? "SETTLED" : "READY"}
         </div>
+        <div className="divider" />
+        <div className="progress">
+          MARKERS MOVED <strong>{movedCount}/7</strong>
+        </div>
+        <div className="bar">
+          <div
+            className="bar-fill"
+            style={{ width: `${(movedCount / 7) * 100}%` }}
+          />
+        </div>
+      </div>
+
+      <div className="log-panel">
+        <h4>MOVE LOG</h4>
+        {log.length === 0 ? (
+          <div className="entry" style={{ color: "#5a6b80" }}>
+            No moves yet
+          </div>
+        ) : (
+          log.map((e) => (
+            <div key={e.id} className={`entry ${e.kind}`}>
+              {e.text}
+            </div>
+          ))
+        )}
       </div>
 
       <div className="hint">DRAG TO ORBIT · CLICK TO TOSS · SCROLL TO ZOOM</div>
