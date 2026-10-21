@@ -6,25 +6,61 @@ import React, {
   useState,
 } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
-import {
-  ContactShadows,
-  Environment,
-  RoundedBox,
-  useTexture,
-} from "@react-three/drei";
+import { Environment, useTexture } from "@react-three/drei";
 import * as THREE from "three";
+import * as CANNON from "cannon-es";
+import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 
+/* ------------------------------------------------------------------ */
+/*  World / map constants                                              */
+/* ------------------------------------------------------------------ */
+
+// abuja-map.png is 1536 x 1024 (3:2). The floor keeps that ratio so the
+// map is never stretched.
+const MAP_PX_W = 1536;
+const MAP_W = 18;
+const MAP_H = 12;
+const UNITS_PER_PX = MAP_W / MAP_PX_W;
+
+// Each toss moves ONE marker this many MAP pixels towards the centre.
+// (Raise this number if you want the markers to travel faster.)
+const MOVE_STEP_PX = 6;
+const MOVE_STEP = MOVE_STEP_PX * UNITS_PER_PX;
+
+const MARKER_COUNT = 7;
+const MARKER_COLORS = [
+  "#ea4335",
+  "#4285f4",
+  "#fbbc04",
+  "#34a853",
+  "#a142f4",
+  "#ff6d01",
+  "#00bcd4",
+];
+// Markers start near the map edge (inset so the tray rim never hides them).
+const EDGE_INSET = 0.84;
+
+/* ------------------------------------------------------------------ */
+/*  Dice constants                                                     */
+/* ------------------------------------------------------------------ */
+
+const DICE_SIZE = 1.3;
+const HALF = DICE_SIZE / 2;
+const GRAVITY = -48;
+
+// RoundedBoxGeometry keeps BoxGeometry's group order: +x, -x, +y, -y, +z, -z.
+// Opposite faces always add up to 7, like a real die.
 const FACE_VALUES = [3, 4, 1, 6, 2, 5];
+const FACE_NORMALS = [
+  [1, 0, 0, 3],
+  [-1, 0, 0, 4],
+  [0, 1, 0, 1],
+  [0, -1, 0, 6],
+  [0, 0, 1, 2],
+  [0, 0, -1, 5],
+];
 
-const FACE_ROTATIONS = {
-  1: [0, 0, 0],
-  2: [-Math.PI / 2, 0, 0],
-  3: [0, 0, -Math.PI / 2],
-  4: [0, 0, Math.PI / 2],
-  5: [Math.PI / 2, 0, 0],
-  6: [0, 0, Math.PI],
-};
-
+// Pip layout in a 3x3 grid (-1, 0, 1).
 const PIP_POSITIONS = {
   1: [[0, 0]],
   2: [
@@ -59,33 +95,92 @@ const PIP_POSITIONS = {
   ],
 };
 
-function makeFaceTexture(value) {
+/* ------------------------------------------------------------------ */
+/*  Textures                                                           */
+/* ------------------------------------------------------------------ */
+
+// Returns a colour map (ivory face + glossy black pips) and a bump map so the
+// pips are drilled into the die like a real one. Pips are spread across the
+// whole face (grid at 27% / 50% / 73%), not crowded towards the middle.
+function makeFaceTextures(value) {
   const size = 512;
-  const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = size;
-  const ctx = canvas.getContext("2d");
+  const spread = 0.235; // distance of outer pips from centre (fraction of face)
+  const pipR = size * 0.088;
 
-  ctx.fillStyle = "#f7f5ef";
-  ctx.fillRect(0, 0, size, size);
+  const make = (draw) => {
+    const c = document.createElement("canvas");
+    c.width = c.height = size;
+    const ctx = c.getContext("2d");
+    draw(ctx);
+    return c;
+  };
 
-  const pipRadius = size * 0.115;
-  ctx.fillStyle = "#17191f";
+  const forEachPip = (cb) => {
+    for (const [nx, ny] of PIP_POSITIONS[value]) {
+      cb(size * (0.5 + nx * spread), size * (0.5 + ny * spread));
+    }
+  };
 
-  for (const [nx, ny] of PIP_POSITIONS[value]) {
-    const inset = size * 0.14;
-    const cx = inset + ((nx + 1) / 2) * (size - inset * 2);
-    const cy = inset + ((ny + 1) / 2) * (size - inset * 2);
-    ctx.beginPath();
-    ctx.arc(cx, cy, pipRadius, 0, Math.PI * 2);
-    ctx.fill();
-  }
+  const colorCanvas = make((ctx) => {
+    const g = ctx.createRadialGradient(
+      size * 0.5,
+      size * 0.45,
+      size * 0.1,
+      size * 0.5,
+      size * 0.5,
+      size * 0.75,
+    );
+    g.addColorStop(0, "#fbf9f2");
+    g.addColorStop(1, "#ebe6d8");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
 
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.anisotropy = 16;
-  texture.needsUpdate = true;
-  return texture;
+    forEachPip((cx, cy) => {
+      const pg = ctx.createRadialGradient(
+        cx - pipR * 0.25,
+        cy - pipR * 0.3,
+        pipR * 0.1,
+        cx,
+        cy,
+        pipR,
+      );
+      pg.addColorStop(0, "#2b2e36");
+      pg.addColorStop(1, "#08090c");
+      ctx.fillStyle = pg;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pipR, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+
+  const bumpCanvas = make((ctx) => {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, size, size);
+    forEachPip((cx, cy) => {
+      const bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, pipR * 1.12);
+      bg.addColorStop(0, "#000000");
+      bg.addColorStop(0.7, "#2a2a2a");
+      bg.addColorStop(1, "#ffffff");
+      ctx.fillStyle = bg;
+      ctx.beginPath();
+      ctx.arc(cx, cy, pipR * 1.12, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+
+  const map = new THREE.CanvasTexture(colorCanvas);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.anisotropy = 16;
+
+  const bump = new THREE.CanvasTexture(bumpCanvas);
+  bump.anisotropy = 16;
+
+  return { map, bump };
 }
+
+// The pin's TIP sits at 86% of the canvas height; the sprite is anchored
+// there so the tip lands exactly on the map.
+const PIN_TIP_FROM_BOTTOM = 0.14;
 
 function makeMarkerTexture(color = "#ea4335") {
   const size = 256;
@@ -98,17 +193,16 @@ function makeMarkerTexture(color = "#ea4335") {
   const headR = size * 0.28;
   const headCY = size * 0.36;
 
-  ctx.fillStyle = "rgba(0,0,0,0.18)";
-  ctx.beginPath();
-  ctx.ellipse(cx, size * 0.9, size * 0.16, size * 0.045, 0, 0, Math.PI * 2);
-  ctx.fill();
-
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(cx, headCY, headR, Math.PI * 0.15, Math.PI * 0.85, true);
   ctx.lineTo(cx, size * 0.86);
   ctx.closePath();
   ctx.fill();
+
+  ctx.strokeStyle = "rgba(0,0,0,0.25)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
 
   ctx.fillStyle = "#ffffff";
   ctx.beginPath();
@@ -129,54 +223,195 @@ function makeMarkerTexture(color = "#ea4335") {
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = 16;
-  texture.needsUpdate = true;
   return texture;
 }
 
-function MapMarker({ texture, animRef, index }) {
+function makeBlobShadowTexture() {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const g = ctx.createRadialGradient(
+    size / 2,
+    size / 2,
+    0,
+    size / 2,
+    size / 2,
+    size / 2,
+  );
+  g.addColorStop(0, "rgba(0,0,0,0.55)");
+  g.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return new THREE.CanvasTexture(canvas);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Audio (collision-driven, so every bounce clicks)                   */
+/* ------------------------------------------------------------------ */
+
+let audioCtx = null;
+let noiseBuffer = null;
+
+function ensureAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!audioCtx) {
+    audioCtx = new AC();
+    const len = Math.floor(audioCtx.sampleRate * 0.12);
+    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+    const d = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+
+function playImpact(speed, hardSurface) {
+  const ctx = audioCtx;
+  if (!ctx || !noiseBuffer) return;
+  const strength = Math.min(speed / 20, 1);
+  if (strength < 0.04) return;
+
+  const now = ctx.currentTime;
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer;
+
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = (hardSurface ? 2600 : 1700) + Math.random() * 1200;
+  bp.Q.value = 1.1;
+
+  const gain = ctx.createGain();
+  const peak = 0.06 + strength * 0.5;
+  gain.gain.setValueAtTime(peak, now);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.05 + strength * 0.05);
+
+  src.connect(bp);
+  bp.connect(gain);
+  gain.connect(ctx.destination);
+  src.start(now);
+  src.stop(now + 0.12);
+
+  // Low "thock" of the die body.
+  const osc = ctx.createOscillator();
+  const og = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(190 + Math.random() * 60, now);
+  osc.frequency.exponentialRampToValueAtTime(90, now + 0.06);
+  og.gain.setValueAtTime(0.0001, now);
+  og.gain.exponentialRampToValueAtTime(0.1 + strength * 0.35, now + 0.004);
+  og.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+  osc.connect(og);
+  og.connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + 0.09);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Markers                                                            */
+/* ------------------------------------------------------------------ */
+
+// A point on the (inset) map border along a given angle from the centre.
+function edgePoint(angle) {
+  const hx = (MAP_W / 2) * EDGE_INSET;
+  const hz = (MAP_H / 2) * EDGE_INSET;
+  const dx = Math.cos(angle);
+  const dz = Math.sin(angle);
+  const t = Math.min(
+    Math.abs(dx) < 1e-6 ? Infinity : hx / Math.abs(dx),
+    Math.abs(dz) < 1e-6 ? Infinity : hz / Math.abs(dz),
+  );
+  return { x: dx * t, z: dz * t };
+}
+
+// Seven well-separated start points around the edge, in random order.
+function makeEdgePoints() {
+  const offset = Math.random() * Math.PI * 2;
+  const pts = [];
+  for (let i = 0; i < MARKER_COUNT; i++) {
+    const jitter = (Math.random() - 0.5) * 0.35;
+    pts.push(edgePoint(offset + (i / MARKER_COUNT) * Math.PI * 2 + jitter));
+  }
+  for (let i = pts.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pts[i], pts[j]] = [pts[j], pts[i]];
+  }
+  return pts;
+}
+
+function MapMarker({ texture, shadowTexture, animRef, index }) {
   const groupRef = useRef();
   const spriteRef = useRef();
+  const shadowRef = useRef();
 
-  useFrame((state, delta) => {
+  useFrame((_, rawDelta) => {
+    const delta = Math.min(rawDelta, 0.05);
     const g = groupRef.current;
     const s = spriteRef.current;
-    if (!g || !s) return;
+    const sh = shadowRef.current;
+    const a = animRef.current.markers?.[index];
+    if (!g || !s || !a) return;
 
-    const a = animRef.current.markers[index];
-    if (!a) return;
+    // First frame: appear directly on the start position.
+    if (!a.placed) {
+      g.position.set(a.x, 0, a.z);
+      a.placed = true;
+    }
 
-    // Move X/Z toward current target.
-    const ease = 1 - Math.exp(-4 * delta);
-    g.position.x = THREE.MathUtils.lerp(g.position.x, a.x, ease);
-    g.position.z = THREE.MathUtils.lerp(g.position.z, a.z, ease);
+    // Glide along the map surface.
+    const ease = 1 - Math.exp(-a.glide * delta);
+    g.position.x += (a.x - g.position.x) * ease;
+    g.position.z += (a.z - g.position.z) * ease;
 
-    // Hop arc: `hop` is 0..1 progress. Only animate y when hopping.
-    let hopHeight = 0;
-    if (a.hopActive && a.hopProgress < 1) {
+    // Small lift while moving, so it feels picked up and set down.
+    let lift = 0;
+    if (a.hopActive) {
       a.hopProgress += delta / a.hopDuration;
       if (a.hopProgress >= 1) {
         a.hopProgress = 1;
         a.hopActive = false;
+      } else {
+        lift = Math.sin(a.hopProgress * Math.PI) * a.hopScale;
       }
-      hopHeight = Math.sin(a.hopProgress * Math.PI) * a.hopScale;
     }
-    s.position.y = 1.15 + hopHeight;
+    s.position.y = 0.02 + lift;
 
-    // Billboard.
-    s.lookAt(
-      state.camera.position.x,
-      s.getWorldPosition(new THREE.Vector3()).y,
-      state.camera.position.z,
-    );
+    const k = 1 / (1 + lift * 1.6);
+    sh.scale.set(0.55 * k, 0.55 * k, 1);
+    sh.material.opacity = 0.9 * k;
   });
 
   return (
-    <group ref={groupRef}>
-      <sprite ref={spriteRef} scale={[1.3, 1.3, 1.3]} position={[0, 1.15, 0]}>
+    <group ref={groupRef} position={[0, 0, 0]}>
+      {/* contact shadow lying on the map */}
+      <mesh
+        ref={shadowRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0.04, 0.012, 0.04]}
+        renderOrder={1}
+      >
+        <planeGeometry args={[1, 1]} />
+        <meshBasicMaterial
+          map={shadowTexture}
+          transparent
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </mesh>
+
+      {/* the pin: its tip is the sprite's anchor, which touches the map */}
+      <sprite
+        ref={spriteRef}
+        scale={[1.15, 1.15, 1]}
+        center={new THREE.Vector2(0.5, PIN_TIP_FROM_BOTTOM)}
+        position={[0, 0.02, 0]}
+        renderOrder={2}
+      >
         <spriteMaterial
           map={texture}
           transparent
-          depthWrite={false}
+          alphaTest={0.05}
           toneMapped={false}
         />
       </sprite>
@@ -184,338 +419,344 @@ function MapMarker({ texture, animRef, index }) {
   );
 }
 
-const MARKER_COUNT = 7;
-const MARKER_COLORS = [
-  "#ea4335",
-  "#4285f4",
-  "#fbbc04",
-  "#34a853",
-  "#ea4335",
-  "#4285f4",
-  "#fbbc04",
-];
-
-// Edge band on the map for marker starting positions.
-const EDGE_MIN_RADIUS = 7.5;
-const EDGE_MAX_RADIUS = 10.5;
-
-// Interior band for marker destinations after a move.
-const INTERIOR_MIN_RADIUS = 2.5;
-const INTERIOR_MAX_RADIUS = 7.0;
-
-function randomEdgePoint(avoid = []) {
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const angle = Math.random() * Math.PI * 2;
-    const r =
-      EDGE_MIN_RADIUS + Math.random() * (EDGE_MAX_RADIUS - EDGE_MIN_RADIUS);
-    const p = { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
-    let tooClose = false;
-    for (const q of avoid) {
-      const dx = p.x - q.x;
-      const dz = p.z - q.z;
-      if (dx * dx + dz * dz < 1.8 * 1.8) {
-        tooClose = true;
-        break;
-      }
-    }
-    if (!tooClose) return p;
-  }
-  const angle = Math.random() * Math.PI * 2;
-  return {
-    x: Math.cos(angle) * EDGE_MIN_RADIUS,
-    z: Math.sin(angle) * EDGE_MIN_RADIUS,
-  };
-}
-
-function randomInteriorPoint(avoid = []) {
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const angle = Math.random() * Math.PI * 2;
-    const r =
-      INTERIOR_MIN_RADIUS +
-      Math.random() * (INTERIOR_MAX_RADIUS - INTERIOR_MIN_RADIUS);
-    const p = { x: Math.cos(angle) * r, z: Math.sin(angle) * r };
-    let tooClose = false;
-    for (const q of avoid) {
-      const dx = p.x - q.x;
-      const dz = p.z - q.z;
-      if (dx * dx + dz * dz < 1.8 * 1.8) {
-        tooClose = true;
-        break;
-      }
-    }
-    if (!tooClose) return p;
-  }
-  const angle = Math.random() * Math.PI * 2;
-  return {
-    x: Math.cos(angle) * INTERIOR_MIN_RADIUS,
-    z: Math.sin(angle) * INTERIOR_MIN_RADIUS,
-  };
-}
-
 function MarkerField({ tossToken, animRef, onMarkerMove }) {
   const textures = useMemo(
-    () => MARKER_COLORS.map((c) => makeMarkerTexture(c)),
+    () => MARKER_COLORS.slice(0, MARKER_COUNT).map((c) => makeMarkerTexture(c)),
     [],
   );
+  const shadowTexture = useMemo(() => makeBlobShadowTexture(), []);
 
-  // Initialize markers on the edge of the map.
+  // Start every marker on the map edge, each at a separate position.
   if (!animRef.current.markers) {
-    const initial = [];
-    for (let i = 0; i < MARKER_COUNT; i++) {
-      const pt = randomEdgePoint(initial.map((m) => ({ x: m.x, z: m.z })));
-      initial.push({
-        x: pt.x,
-        z: pt.z,
-        hopProgress: 1,
-        hopActive: false,
-        hopDuration: 0.9,
-        hopScale: 0.55,
-      });
-    }
-    animRef.current.markers = initial;
-    // Track which markers have already moved in the current cycle.
-    animRef.current.movedCount = 0;
+    const pts = makeEdgePoints();
+    animRef.current.markers = pts.map((p) => ({
+      x: p.x,
+      z: p.z,
+      arrived: false,
+      glide: 8,
+      hopProgress: 1,
+      hopActive: false,
+      hopDuration: 0.5,
+      hopScale: 0.2,
+    }));
+    animRef.current.next = 0;
   }
 
-  // On each toss, move exactly ONE marker (the next one in sequence).
+  // Place the groups on their start positions before the first frame.
+  useEffect(() => {
+    return () => {
+      textures.forEach((t) => t.dispose());
+      shadowTexture.dispose();
+    };
+  }, [textures, shadowTexture]);
+
   useEffect(() => {
     if (!tossToken) return;
-
     const state = animRef.current;
-    if (!state.markers) return;
+    const markers = state.markers;
+    if (!markers) return;
 
-    // If all markers have moved, reset the cycle: all return to the edge.
-    if (state.movedCount >= MARKER_COUNT) {
-      state.movedCount = 0;
-      for (let i = 0; i < state.markers.length; i++) {
-        const others = state.markers
-          .filter((_, idx) => idx !== i)
-          .map((m) => ({ x: m.x, z: m.z }));
-        const pt = randomEdgePoint(others);
-        const m = state.markers[i];
-        m.x = pt.x;
-        m.z = pt.z;
+    // Every marker has reached the centre -> start a new cycle on the edges.
+    if (markers.every((m) => m.arrived)) {
+      const pts = makeEdgePoints();
+      markers.forEach((m, i) => {
+        m.x = pts[i].x;
+        m.z = pts[i].z;
+        m.arrived = false;
+        m.glide = 2.2;
         m.hopProgress = 0;
         m.hopActive = true;
-        m.hopDuration = 0.9;
-        m.hopScale = 0.4 + Math.random() * 0.5;
-      }
-      onMarkerMove?.(0, "reset");
+        m.hopDuration = 1.3;
+        m.hopScale = 1.4;
+      });
+      state.next = 0;
+      onMarkerMove?.({ type: "reset", arrivedCount: 0 });
       return;
     }
 
-    // Otherwise move ONE marker (the next in line).
-    const idx = state.movedCount;
-    const others = state.markers
-      .filter((_, i) => i !== idx)
-      .map((m) => ({ x: m.x, z: m.z }));
-    const pt = randomInteriorPoint(others);
+    // Find the next marker (in order) that hasn't reached the centre yet.
+    let idx = state.next % markers.length;
+    for (let n = 0; n < markers.length && markers[idx].arrived; n++) {
+      idx = (idx + 1) % markers.length;
+    }
+    const m = markers[idx];
 
-    const m = state.markers[idx];
-    m.x = pt.x;
-    m.z = pt.z;
+    // Move it MOVE_STEP_PX map pixels straight towards the centre.
+    const dist = Math.hypot(m.x, m.z);
+    if (dist <= MOVE_STEP) {
+      m.x = 0;
+      m.z = 0;
+      m.arrived = true;
+    } else {
+      m.x -= (m.x / dist) * MOVE_STEP;
+      m.z -= (m.z / dist) * MOVE_STEP;
+    }
+    m.glide = 9;
     m.hopProgress = 0;
     m.hopActive = true;
-    m.hopDuration = 1.1;
-    m.hopScale = 0.6 + Math.random() * 0.6;
+    m.hopDuration = 0.45;
+    m.hopScale = 0.18;
 
-    state.movedCount += 1;
-    onMarkerMove?.(idx + 1, "moved");
+    state.next = (idx + 1) % markers.length;
+
+    onMarkerMove?.({
+      type: "moved",
+      index: idx + 1,
+      arrived: m.arrived,
+      remainingPx: Math.round(Math.hypot(m.x, m.z) / UNITS_PER_PX),
+      arrivedCount: markers.filter((k) => k.arrived).length,
+    });
   }, [tossToken, animRef, onMarkerMove]);
 
   return (
     <group>
       {textures.map((tex, i) => (
-        <MapMarker key={i} index={i} texture={tex} animRef={animRef} />
+        <MapMarker
+          key={i}
+          index={i}
+          texture={tex}
+          shadowTexture={shadowTexture}
+          animRef={animRef}
+        />
       ))}
     </group>
   );
 }
 
-const DICE_SIZE = 2;
-const REST_Y = DICE_SIZE / 2;
-const GRAVITY = -14;
-const TOSS_VELOCITY_MIN = 13;
-const TOSS_VELOCITY_MAX = 16;
-const BOUNCE_DAMPING = 0.45;
-const MIN_BOUNCE = 2.0;
+/* ------------------------------------------------------------------ */
+/*  Physics dice                                                       */
+/* ------------------------------------------------------------------ */
 
-const cameraState = {
-  cinematic: false,
-};
+function readTopFace(quaternion) {
+  const v = new THREE.Vector3();
+  let best = { value: 1, dot: -2 };
+  for (const [x, y, z, value] of FACE_NORMALS) {
+    v.set(x, y, z).applyQuaternion(quaternion);
+    if (v.y > best.dot) best = { value, dot: v.y };
+  }
+  return best;
+}
 
-let currentApexY = 0;
+function createPhysics() {
+  const world = new CANNON.World({ gravity: new CANNON.Vec3(0, GRAVITY, 0) });
+  world.allowSleep = true;
+  world.solver.iterations = 24;
 
-function Dice({ tossToken, onResult, orbitState }) {
-  const diceRef = useRef();
-  const anim = useRef(null);
+  const diceMat = new CANNON.Material("dice");
+  const floorMat = new CANNON.Material("floor");
+  const wallMat = new CANNON.Material("wall");
+
+  world.addContactMaterial(
+    new CANNON.ContactMaterial(diceMat, floorMat, {
+      friction: 0.42,
+      restitution: 0.38,
+    }),
+  );
+  world.addContactMaterial(
+    new CANNON.ContactMaterial(diceMat, wallMat, {
+      friction: 0.2,
+      restitution: 0.55,
+    }),
+  );
+
+  // Floor (the map surface).
+  const floor = new CANNON.Body({ mass: 0, material: floorMat });
+  floor.addShape(new CANNON.Plane());
+  floor.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+  world.addBody(floor);
+
+  // Tall invisible walls on the map edge (the visible tray rim is lower).
+  const addWall = (hx, hy, hz, x, z) => {
+    const w = new CANNON.Body({ mass: 0, material: wallMat });
+    w.addShape(new CANNON.Box(new CANNON.Vec3(hx, hy, hz)));
+    w.position.set(x, hy, z);
+    world.addBody(w);
+  };
+  const t = 0.5;
+  addWall(MAP_W / 2 + 1, 6, t, 0, MAP_H / 2 + t);
+  addWall(MAP_W / 2 + 1, 6, t, 0, -MAP_H / 2 - t);
+  addWall(t, 6, MAP_H / 2 + 1, MAP_W / 2 + t, 0);
+  addWall(t, 6, MAP_H / 2 + 1, -MAP_W / 2 - t, 0);
+
+  // The die. Slightly inset so the rounded visual corners don't float.
+  const h = HALF - 0.015;
+  const body = new CANNON.Body({
+    mass: 1,
+    material: diceMat,
+    shape: new CANNON.Box(new CANNON.Vec3(h, h, h)),
+    linearDamping: 0.04,
+    angularDamping: 0.2,
+    allowSleep: true,
+    sleepSpeedLimit: 0.35,
+    sleepTimeLimit: 0.4,
+  });
+  body.position.set(0, HALF, 0);
+  world.addBody(body);
+
+  return { world, body };
+}
+
+function Dice({ tossToken, onResult }) {
+  const meshRef = useRef();
+  const physics = useMemo(() => createPhysics(), []);
+  const tossRef = useRef(null);
+  const lastHit = useRef(0);
+
+  const geometry = useMemo(
+    () => new RoundedBoxGeometry(DICE_SIZE, DICE_SIZE, DICE_SIZE, 6, 0.1),
+    [],
+  );
 
   const materials = useMemo(
     () =>
       FACE_VALUES.map((value) => {
-        const texture = makeFaceTexture(value);
-        return new THREE.MeshStandardMaterial({
-          map: texture,
-          roughness: 0.3,
-          metalness: 0.02,
+        const { map, bump } = makeFaceTextures(value);
+        return new THREE.MeshPhysicalMaterial({
+          map,
+          bumpMap: bump,
+          bumpScale: 2.2,
+          roughness: 0.28,
+          metalness: 0,
+          clearcoat: 0.6,
+          clearcoatRoughness: 0.25,
         });
       }),
     [],
   );
 
-  useEffect(() => {
-    return () =>
+  useEffect(
+    () => () => {
+      geometry.dispose();
       materials.forEach((m) => {
         m.map?.dispose();
+        m.bumpMap?.dispose();
         m.dispose();
       });
-  }, [materials]);
+    },
+    [geometry, materials],
+  );
 
+  // Bounce sounds + start position.
   useEffect(() => {
-    if (!tossToken || !diceRef.current) return;
+    const { body } = physics;
+    const onCollide = (e) => {
+      const now = performance.now();
+      if (now - lastHit.current < 45) return;
+      const speed = Math.abs(e.contact.getImpactVelocityAlongNormal());
+      if (speed < 0.9) return;
+      lastHit.current = now;
+      const other = e.body === body ? e.target : e.body;
+      playImpact(speed, other?.shapes?.[0] instanceof CANNON.Box);
+    };
+    body.addEventListener("collide", onCollide);
+    return () => body.removeEventListener("collide", onCollide);
+  }, [physics]);
 
-    const value = Math.floor(Math.random() * 6) + 1;
-    const base = FACE_ROTATIONS[value];
+  // Throw the die.
+  useEffect(() => {
+    if (!tossToken) return;
+    const { body } = physics;
+    const rand = (min, max) => min + Math.random() * (max - min);
+    const sign = () => (Math.random() < 0.5 ? -1 : 1);
 
-    const spinsX = (2 + Math.floor(Math.random() * 3)) * Math.PI * 2;
-    const spinsY = (2 + Math.floor(Math.random() * 3)) * Math.PI * 2;
-    const spinsZ = (2 + Math.floor(Math.random() * 3)) * Math.PI * 2;
+    // Picked up from where it lies, lifted, then thrown across the map.
+    const limX = MAP_W / 2 - 2.2;
+    const limZ = MAP_H / 2 - 2.2;
+    const sx = THREE.MathUtils.clamp(body.position.x, -limX, limX);
+    const sz = THREE.MathUtils.clamp(body.position.z, -limZ, limZ);
 
-    diceRef.current.position.set(0, REST_Y, 0);
-    diceRef.current.rotation.set(
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
+    body.wakeUp();
+    body.position.set(sx, rand(2.2, 3.2), sz);
+    body.quaternion.setFromEuler(
+      rand(0, Math.PI * 2),
+      rand(0, Math.PI * 2),
+      rand(0, Math.PI * 2),
     );
 
-    anim.current = {
-      value,
-      fromRot: diceRef.current.rotation.clone(),
-      targetRot: new THREE.Euler(
-        base[0] + spinsX,
-        base[1] + spinsY,
-        base[2] + spinsZ,
-      ),
-      rotElapsed: 0,
-      rotDuration: 2.4 + Math.random() * 0.5,
-      rotDone: false,
-      y: REST_Y,
-      vy:
-        TOSS_VELOCITY_MIN +
-        Math.random() * (TOSS_VELOCITY_MAX - TOSS_VELOCITY_MIN),
-      settled: false,
-    };
+    const tx = rand(-MAP_W * 0.25, MAP_W * 0.25);
+    const tz = rand(-MAP_H * 0.2, MAP_H * 0.2);
+    const dx = tx - sx;
+    const dz = tz - sz;
+    const len = Math.hypot(dx, dz) || 1;
+    const speed = rand(8, 15);
 
-    currentApexY = 0;
-    cameraState.cinematic = true;
-  }, [tossToken]);
+    body.velocity.set((dx / len) * speed, rand(7, 12), (dz / len) * speed);
+    body.angularVelocity.set(
+      sign() * rand(14, 34),
+      sign() * rand(14, 34),
+      sign() * rand(14, 34),
+    );
 
-  useFrame((state, delta) => {
-    const dice = diceRef.current;
-    if (!dice) return;
+    tossRef.current = { elapsed: 0, still: 0, nudges: 0 };
+  }, [tossToken, physics]);
 
-    const a = anim.current;
+  useFrame((_, rawDelta) => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+    const { world, body } = physics;
 
-    if (a) {
-      if (!a.rotDone) {
-        a.rotElapsed += delta;
-        const t = Math.min(a.rotElapsed / a.rotDuration, 1);
-        const eased = 1 - Math.pow(1 - t, 3);
-        dice.rotation.set(
-          THREE.MathUtils.lerp(a.fromRot.x, a.targetRot.x, eased),
-          THREE.MathUtils.lerp(a.fromRot.y, a.targetRot.y, eased),
-          THREE.MathUtils.lerp(a.fromRot.z, a.targetRot.z, eased),
+    world.step(1 / 120, Math.min(rawDelta, 0.05), 10);
+
+    mesh.position.copy(body.position);
+    mesh.quaternion.copy(body.quaternion);
+
+    const t = tossRef.current;
+    if (!t) return;
+    t.elapsed += rawDelta;
+
+    const calm =
+      body.velocity.length() < 0.25 && body.angularVelocity.length() < 0.45;
+    if (t.elapsed > 0.5 && calm) t.still += rawDelta;
+    else t.still = 0;
+
+    const stopped =
+      t.still > 0.35 || body.sleepState === CANNON.Body.SLEEPING;
+    const stuck = t.elapsed > 9;
+
+    if (stopped || stuck) {
+      const { value, dot } = readTopFace(mesh.quaternion);
+      // Cocked against a wall or another edge? Give it a little shake.
+      if (dot < 0.985 && t.nudges < 4) {
+        t.nudges += 1;
+        t.still = 0;
+        t.elapsed = 0;
+        body.wakeUp();
+        body.velocity.set(
+          (Math.random() - 0.5) * 3,
+          rand(5, 7),
+          (Math.random() - 0.5) * 3,
         );
-        if (t >= 1) {
-          dice.rotation.copy(a.targetRot);
-          a.rotDone = true;
-        }
+        body.angularVelocity.set(
+          (Math.random() - 0.5) * 12,
+          (Math.random() - 0.5) * 12,
+          (Math.random() - 0.5) * 12,
+        );
+        return;
       }
-
-      if (!a.settled) {
-        a.vy += GRAVITY * delta;
-        a.y += a.vy * delta;
-        if (a.y > currentApexY) currentApexY = a.y;
-
-        if (a.y <= REST_Y) {
-          a.y = REST_Y;
-          if (Math.abs(a.vy) < MIN_BOUNCE) {
-            a.vy = 0;
-            a.settled = true;
-          } else {
-            a.vy = -a.vy * BOUNCE_DAMPING;
-            dice.rotation.y += (Math.random() - 0.5) * 0.06;
-            dice.rotation.x += (Math.random() - 0.5) * 0.06;
-          }
-        }
-        dice.position.y = a.y;
-      }
-
-      if (a.rotDone && a.settled) {
-        dice.position.y = REST_Y;
-        const result = a.value;
-        anim.current = null;
-        cameraState.cinematic = false;
-        onResult(result);
-      }
-    }
-
-    const orbit = orbitState?.current;
-    if (orbit) {
-      const airborne = cameraState.cinematic && anim.current;
-
-      let targetRadius;
-      let targetLookY;
-
-      if (airborne) {
-        const apex = Math.max(currentApexY, REST_Y);
-        targetRadius = Math.max(16, apex * 2.6 + 8);
-        targetLookY = apex * 0.45;
-      } else {
-        targetRadius = 14;
-        targetLookY = REST_Y * 0.8;
-      }
-
-      const ease = 1 - Math.exp(-2.5 * delta);
-      orbit.radius = THREE.MathUtils.lerp(orbit.radius, targetRadius, ease);
-      orbit.lookY = THREE.MathUtils.lerp(
-        orbit.lookY ?? targetLookY,
-        targetLookY,
-        ease,
-      );
-
-      const sp = Math.sin(orbit.phi);
-      state.camera.position.set(
-        orbit.radius * sp * Math.cos(orbit.theta),
-        orbit.radius * Math.cos(orbit.phi),
-        orbit.radius * sp * Math.sin(orbit.theta),
-      );
-      state.camera.lookAt(0, orbit.lookY, 0);
+      tossRef.current = null;
+      onResult(value);
     }
   });
 
+  function rand(min, max) {
+    return min + Math.random() * (max - min);
+  }
+
   return (
-    <group>
-      <RoundedBox
-        ref={diceRef}
-        args={[DICE_SIZE, DICE_SIZE, DICE_SIZE]}
-        radius={0.14}
-        smoothness={6}
-        position={[0, REST_Y, 0]}
-        castShadow
-        receiveShadow
-      >
-        {materials.map((material, index) => (
-          <primitive
-            key={index}
-            object={material}
-            attach={`material-${index}`}
-          />
-        ))}
-      </RoundedBox>
-    </group>
+    <mesh
+      ref={meshRef}
+      geometry={geometry}
+      material={materials}
+      position={[0, HALF, 0]}
+      castShadow
+      receiveShadow
+    />
   );
 }
+
+/* ------------------------------------------------------------------ */
+/*  Table, map and tray                                                */
+/* ------------------------------------------------------------------ */
 
 function AbujaFloor() {
   const map = useTexture("/abuja-map.png");
@@ -528,69 +769,84 @@ function AbujaFloor() {
   }, [map]);
 
   return (
-    <mesh
-      rotation={[-Math.PI / 2, 0, 0]}
-      position={[0, -0.03, 0]}
-      receiveShadow
-    >
-      <planeGeometry args={[60, 60]} />
-      <meshStandardMaterial map={map} roughness={0.95} metalness={0} />
+    <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+      <planeGeometry args={[MAP_W, MAP_H]} />
+      <meshStandardMaterial
+        map={map}
+        emissive="#ffffff"
+        emissiveMap={map}
+        emissiveIntensity={0.35}
+        roughness={0.9}
+        metalness={0}
+      />
     </mesh>
   );
 }
 
-function playDiceSound() {
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) return;
-
-  const audio = new AC();
-  const duration = 0.8;
-  const buffer = audio.createBuffer(
-    1,
-    audio.sampleRate * duration,
-    audio.sampleRate,
+function Tray() {
+  const rimH = 0.55;
+  const rimT = 0.6;
+  const mat = (
+    <meshStandardMaterial color="#2b1e16" roughness={0.55} metalness={0.05} />
   );
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < data.length; i++) {
-    const t = i / audio.sampleRate;
-    data[i] = (Math.random() * 2 - 1) * Math.exp(-t * 3.5);
-  }
+  return (
+    <group>
+      {/* table */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.02, 0]} receiveShadow>
+        <planeGeometry args={[120, 120]} />
+        <meshStandardMaterial color="#0d141f" roughness={1} />
+      </mesh>
+      {/* rim */}
+      <mesh position={[0, rimH / 2, MAP_H / 2 + rimT / 2]} castShadow receiveShadow>
+        <boxGeometry args={[MAP_W + rimT * 2, rimH, rimT]} />
+        {mat}
+      </mesh>
+      <mesh position={[0, rimH / 2, -MAP_H / 2 - rimT / 2]} castShadow receiveShadow>
+        <boxGeometry args={[MAP_W + rimT * 2, rimH, rimT]} />
+        {mat}
+      </mesh>
+      <mesh position={[MAP_W / 2 + rimT / 2, rimH / 2, 0]} castShadow receiveShadow>
+        <boxGeometry args={[rimT, rimH, MAP_H]} />
+        {mat}
+      </mesh>
+      <mesh position={[-MAP_W / 2 - rimT / 2, rimH / 2, 0]} castShadow receiveShadow>
+        <boxGeometry args={[rimT, rimH, MAP_H]} />
+        {mat}
+      </mesh>
+    </group>
+  );
+}
 
-  const src = audio.createBufferSource();
-  const filter = audio.createBiquadFilter();
-  const gain = audio.createGain();
-  src.buffer = buffer;
-  filter.type = "lowpass";
-  filter.frequency.value = 1800;
-  gain.gain.value = 0.22;
-  src.connect(filter);
-  filter.connect(gain);
-  gain.connect(audio.destination);
-  src.start();
+/* ------------------------------------------------------------------ */
+/*  Camera + input                                                     */
+/* ------------------------------------------------------------------ */
 
-  for (let i = 0; i < 7; i++) {
-    const osc = audio.createOscillator();
-    const g = audio.createGain();
-    const s = audio.currentTime + i * 0.095;
-    osc.type = "triangle";
-    osc.frequency.value = 180 + Math.random() * 300;
-    g.gain.setValueAtTime(0.0001, s);
-    g.gain.exponentialRampToValueAtTime(0.12, s + 0.008);
-    g.gain.exponentialRampToValueAtTime(0.0001, s + 0.065);
-    osc.connect(g);
-    g.connect(audio.destination);
-    osc.start(s);
-    osc.stop(s + 0.07);
-  }
+function CameraRig({ orbitState }) {
+  useFrame(({ camera, size }, rawDelta) => {
+    const s = orbitState.current;
+    const delta = Math.min(rawDelta, 0.05);
+    const aspect = size.width / size.height;
 
-  src.onended = () => audio.close();
+    // Keep the whole map in view on narrow (portrait) screens.
+    const base = 21 * Math.max(1, 1.75 / aspect);
+    const target = base * s.zoom;
+    s.radius += (target - s.radius) * (1 - Math.exp(-6 * delta));
+
+    const sp = Math.sin(s.phi);
+    camera.position.set(
+      s.radius * sp * Math.cos(s.theta),
+      s.radius * Math.cos(s.phi),
+      s.radius * sp * Math.sin(s.theta),
+    );
+    camera.lookAt(0, 0.2, 0);
+  });
+  return null;
 }
 
 function useOrbitDrag(wrapRef, orbitState) {
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-
     const s = orbitState.current;
 
     const onDown = (e) => {
@@ -612,7 +868,7 @@ function useOrbitDrag(wrapRef, orbitState) {
 
       s.theta -= dx * 0.005;
       s.phi -= dy * 0.005;
-      s.phi = Math.max(0.25, Math.min(Math.PI / 2.1, s.phi));
+      s.phi = Math.max(0.25, Math.min(Math.PI / 2.15, s.phi));
     };
 
     const onUp = () => {
@@ -621,17 +877,14 @@ function useOrbitDrag(wrapRef, orbitState) {
 
     const onWheel = (e) => {
       e.preventDefault();
-      if (!s.dragging) {
-        s.radius += e.deltaY * 0.01;
-        s.radius = Math.max(5, Math.min(30, s.radius));
-      }
+      s.zoom = Math.max(0.45, Math.min(1.7, s.zoom + e.deltaY * 0.001));
     };
 
     el.addEventListener("mousedown", onDown);
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     el.addEventListener("touchstart", onDown, { passive: true });
-    window.addEventListener("touchmove", onMove, { passive: false });
+    window.addEventListener("touchmove", onMove, { passive: true });
     window.addEventListener("touchend", onUp);
     el.addEventListener("wheel", onWheel, { passive: false });
 
@@ -647,76 +900,83 @@ function useOrbitDrag(wrapRef, orbitState) {
   }, [wrapRef, orbitState]);
 }
 
+/* ------------------------------------------------------------------ */
+/*  App                                                                */
+/* ------------------------------------------------------------------ */
+
 export default function AbujaDice() {
   const [tossToken, setTossToken] = useState(0);
   const [result, setResult] = useState(null);
   const [rolling, setRolling] = useState(false);
-  // Track markers moved this cycle: value 0..7.
-  const [movedCount, setMovedCount] = useState(0);
-  // Log of movement events.
+  const [arrivedCount, setArrivedCount] = useState(0);
+  const [tosses, setTosses] = useState(0);
   const [log, setLog] = useState([]);
 
   const wrapRef = useRef(null);
+  const logId = useRef(0);
+  const rollingRef = useRef(false);
 
   const orbitState = useRef({
     dragging: false,
     dragDistance: 0,
     lastX: 0,
     lastY: 0,
-    theta: Math.PI / 4,
-    phi: Math.PI / 3.2,
-    radius: 14,
-    lookY: REST_Y * 0.8,
+    theta: Math.PI / 2, // camera in front, north (top of the map) is away
+    phi: 0.85,
+    radius: 26,
+    zoom: 1,
   });
 
-  const markerAnimRef = useRef({ markers: null, movedCount: 0 });
+  const markerAnimRef = useRef({ markers: null, next: 0 });
 
   useOrbitDrag(wrapRef, orbitState);
 
   const toss = useCallback(() => {
-    if (rolling) return;
+    if (rollingRef.current) return;
+    rollingRef.current = true;
+    ensureAudio();
     setRolling(true);
-    playDiceSound();
+    setTosses((n) => n + 1);
     setTossToken((t) => t + 1);
-  }, [rolling]);
+  }, []);
 
   const recordResult = useCallback((value) => {
+    rollingRef.current = false;
     setResult(value);
     setRolling(false);
   }, []);
 
-  const handleMarkerMove = useCallback((count, kind) => {
-    if (kind === "reset") {
-      setMovedCount(0);
-      setLog((l) =>
-        [
-          {
-            id: Date.now(),
-            text: "All markers returned to the edge — new cycle",
-            kind: "reset",
-          },
-          ...l,
-        ].slice(0, 8),
-      );
-    } else {
-      setMovedCount(count);
-      setLog((l) =>
-        [
-          {
-            id: Date.now(),
-            text: `Marker ${count} moved (${count}/7)`,
-            kind: "moved",
-          },
-          ...l,
-        ].slice(0, 8),
-      );
-    }
+  const handleMarkerMove = useCallback((info) => {
+    const id = ++logId.current;
+    setArrivedCount(info.arrivedCount);
+    const entry =
+      info.type === "reset"
+        ? { id, kind: "reset", text: "All markers at the centre. New cycle" }
+        : {
+            id,
+            kind: info.arrived ? "arrived" : "moved",
+            text: info.arrived
+              ? `Marker ${info.index} reached the centre`
+              : `Marker ${info.index} moved ${MOVE_STEP_PX}px (${info.remainingPx}px left)`,
+          };
+    setLog((l) => [entry, ...l].slice(0, 8));
   }, []);
 
   const handleClick = useCallback(() => {
     if (orbitState.current.dragDistance > 6) return;
     toss();
-  }, [toss, orbitState]);
+  }, [toss]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        toss();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toss]);
 
   return (
     <main
@@ -736,7 +996,7 @@ export default function AbujaDice() {
         * { box-sizing: border-box; }
         .result-panel {
           position: fixed; top: 20px; right: 20px; z-index: 10;
-          min-width: 180px; padding: 16px 20px;
+          min-width: 190px; padding: 16px 20px;
           background: rgba(16, 26, 39, 0.85);
           border: 1px solid #3a4c62; border-radius: 14px;
           backdrop-filter: blur(10px);
@@ -748,13 +1008,13 @@ export default function AbujaDice() {
         .result-panel .status { font-size: 10px; letter-spacing: 1.2px; margin-top: 6px; color: #75c9a1; }
         .result-panel .status.rolling { color: #e7b86c; }
         .result-panel .divider { height: 1px; background: #2c3a4b; margin: 12px 0; }
-        .result-panel .progress { font-size: 11px; color: #96a6b9; letter-spacing: 1px; }
+        .result-panel .progress { font-size: 11px; color: #96a6b9; letter-spacing: 1px; line-height: 1.7; }
         .result-panel .progress strong { color: #f1c47d; }
         .result-panel .bar { height: 4px; background: #1e2937; border-radius: 2px; margin-top: 6px; overflow: hidden; }
         .result-panel .bar-fill { height: 100%; background: #75c9a1; transition: width 0.3s ease; }
         .log-panel {
-          position: fixed; top: 220px; right: 20px; z-index: 10;
-          width: 180px; max-height: 40vh; overflow-y: auto;
+          position: fixed; top: 255px; right: 20px; z-index: 10;
+          width: 190px; max-height: 40vh; overflow-y: auto;
           background: rgba(16, 26, 39, 0.75);
           border: 1px solid #2c3a4b; border-radius: 12px;
           padding: 12px; font-family: 'DM Mono', ui-monospace, monospace;
@@ -764,10 +1024,11 @@ export default function AbujaDice() {
         .log-panel h4 { margin: 0 0 8px; font-size: 9px; letter-spacing: 1.5px; color: #f1c47d; }
         .log-panel .entry { padding: 4px 0; border-bottom: 1px solid #1e2937; }
         .log-panel .entry.reset { color: #e7b86c; }
+        .log-panel .entry.arrived { color: #75c9a1; }
         .hint { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 10;
           font-family: 'DM Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 1.5px;
           color: #96a6b9; background: rgba(16,26,39,0.7); padding: 8px 14px; border-radius: 20px;
-          border: 1px solid #2c3a4b; pointer-events: none; user-select: none; }
+          border: 1px solid #2c3a4b; pointer-events: none; user-select: none; white-space: nowrap; }
       `}</style>
 
       <div
@@ -778,29 +1039,34 @@ export default function AbujaDice() {
         <Canvas
           shadows
           dpr={[1, 2]}
-          camera={{ position: [6.4, 6.2, 8.5], fov: 45, near: 0.1, far: 200 }}
+          camera={{ position: [0, 17, 13], fov: 45, near: 0.1, far: 300 }}
           gl={{ antialias: true }}
           style={{ width: "100%", height: "100%", display: "block" }}
         >
-          <color attach="background" args={["#101a27"]} />
-          <ambientLight intensity={1.15} />
+          <color attach="background" args={["#0b111b"]} />
+          <ambientLight intensity={0.55} />
           <directionalLight
-            position={[4, 9, 5]}
-            intensity={3}
+            position={[6, 14, 8]}
+            intensity={2.6}
             castShadow
             shadow-mapSize-width={2048}
             shadow-mapSize-height={2048}
+            shadow-camera-left={-14}
+            shadow-camera-right={14}
+            shadow-camera-top={12}
+            shadow-camera-bottom={-12}
+            shadow-camera-near={1}
+            shadow-camera-far={45}
+            shadow-bias={-0.0004}
+            shadow-normalBias={0.02}
+            shadow-radius={4}
           />
           <Environment preset="city" />
 
+          <CameraRig orbitState={orbitState} />
+
+          <Tray />
           <AbujaFloor />
-          <ContactShadows
-            position={[0, 0, 0]}
-            opacity={0.55}
-            scale={20}
-            blur={2.5}
-            far={4}
-          />
 
           <MarkerField
             tossToken={tossToken}
@@ -808,11 +1074,7 @@ export default function AbujaDice() {
             onMarkerMove={handleMarkerMove}
           />
 
-          <Dice
-            tossToken={tossToken}
-            onResult={recordResult}
-            orbitState={orbitState}
-          />
+          <Dice tossToken={tossToken} onResult={recordResult} />
         </Canvas>
       </div>
 
@@ -824,12 +1086,17 @@ export default function AbujaDice() {
         </div>
         <div className="divider" />
         <div className="progress">
-          MARKERS MOVED <strong>{movedCount}/7</strong>
+          TOSSES <strong>{tosses}</strong>
+          <br />
+          AT CENTRE{" "}
+          <strong>
+            {arrivedCount}/{MARKER_COUNT}
+          </strong>
         </div>
         <div className="bar">
           <div
             className="bar-fill"
-            style={{ width: `${(movedCount / 7) * 100}%` }}
+            style={{ width: `${(arrivedCount / MARKER_COUNT) * 100}%` }}
           />
         </div>
       </div>
@@ -849,7 +1116,9 @@ export default function AbujaDice() {
         )}
       </div>
 
-      <div className="hint">DRAG TO ORBIT · CLICK TO TOSS · SCROLL TO ZOOM</div>
+      <div className="hint">
+        DRAG TO ORBIT · CLICK OR SPACE TO TOSS · SCROLL TO ZOOM
+      </div>
     </main>
   );
 }
